@@ -1,0 +1,379 @@
+# Google Cloud Workflows definition for Highly Parallel PMTiles Generation
+# Fourth Revision: Implements robust Cloud Run Job polling subworkflow & explicit task generation.
+
+main:
+  params: [args] # Expected: input_parquet_gcs_path, tiling_config_gcs_path, output_pmtiles_gcs_path, temp_gcs_bucket
+  steps:
+    - init_variables:
+        assign:
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - location: "us-central1" # Your Cloud Run Job region
+          - workflow_execution_id: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+          - input_parquet_gcs_path: ${args.input_parquet_gcs_path}
+          - tiling_config_gcs_path: ${args.tiling_config_gcs_path}
+          - output_pmtiles_gcs_path: ${args.output_pmtiles_gcs_path}
+          - temp_gcs_bucket_name: ${args.temp_gcs_bucket}
+          - report_gcs_path: ${"gs://" + args.temp_gcs_bucket + "/reports/" + workflow_execution_id + "_summary_report.json"}
+          # Retry policy for the *call* to the subworkflow (e.g., if Workflow API itself has transient issues)
+          - subworkflow_call_retry_policy:
+              predicate: ${http.default_retry_predicate}
+              max_retries: 3
+              backoff: { initial_delay: 30, max_delay: 120, multiplier: 2 }
+          # Retry policy for the job execution *within* the subworkflow (passed as param)
+          - job_execution_retry_policy:
+              max_retries: 3 # Number of times the Cloud Run Job itself can be retried by the subworkflow if it fails
+              backoff: { initial_delay: 120, max_delay: 600, multiplier: 2 } # Backoff for job retries
+          - overall_status: "SUCCESS"
+          - error_messages: []
+          - mvt_generation_tasks: []
+          - all_mvt_job_outputs: [] # Collects GCS paths of MVT directories from successful tasks
+
+          - MVT_GENERATOR_JOB_NAME_SUFFIX: "mvt-tile-generator-job" # Suffix, full path constructed in subworkflow
+          - MVT_CONSOLIDATOR_JOB_NAME_SUFFIX: "mvt-consolidator-job"
+          - PMTILES_ASSEMBLER_JOB_NAME_SUFFIX: "pmtiles-assembler-job"
+
+          - POLLING_INTERVAL_SECONDS: 30
+          - MAX_POLLING_ITERATIONS_MVT: 120 # 120 * 30s = 1 hour for MVT jobs
+          - MAX_POLLING_ITERATIONS_CONSOLIDATE: 60 # 30 minutes for consolidation
+          - MAX_POLLING_ITERATIONS_ASSEMBLE: 240 # 2 hours for assembly
+
+    - log_start:
+        call: sys.log
+        args: { text: "Starting PMTiles generation. Workflow ID: " + workflow_execution_id, severity: "INFO" }
+
+    - load_tiling_config:
+        try:
+          call: http.get
+          args:
+            url: ${"https://storage.googleapis.com/storage/v1/b/" + temp_gcs_bucket_name + "/o/" + replace(tiling_config_gcs_path,"gs://"+temp_gcs_bucket_name+"/","") + "?alt=media" } # Construct GCS object URL
+            auth: { type: OAuth2 }
+          result: tiling_config_response
+          assign:
+            - tiling_config: ${json.decode(tiling_config_response.body)}
+        except:
+          assign:
+            - overall_status: "FAILURE"
+            - error_messages: ${error_messages + [{"stage": "LOAD_CONFIG", "error": "Failed to load tiling config: " + tiling_config_gcs_path, "details": error}]}
+          next: write_final_report
+
+    # STAGE 1: Explicit Task Generation (Spatial Grid x Zoom Segments)
+    - calculate_grid_cell_dimensions:
+        switch:
+          - condition: ${overall_status == "FAILURE"}
+            next: generate_task_list_step # Skip to end if already failed
+        assign:
+          - data_bbox: ${tiling_config.spatial_split_config.data_bbox_override} # [minLon, minLat, maxLon, maxLat]
+          - grid_cols: ${int(tiling_config.spatial_split_config.grid_divisions[0])}
+          - grid_rows: ${int(tiling_config.spatial_split_config.grid_divisions[1])}
+          - cell_width: ${(data_bbox[2] - data_bbox[0]) / grid_cols}
+          - cell_height: ${(data_bbox[3] - data_bbox[1]) / grid_rows}
+
+    - generate_task_list_step:
+        switch:
+          - condition: ${overall_status == "FAILURE"}
+            next: run_mvt_generation_jobs_step # Skip to end if already failed
+        assign:
+          - temp_tasks_list: []
+        # Outer loop for grid rows (y-axis)
+        for:
+          value: j # row index
+          range: [0, ${grid_rows - 1}] # Corrected range to be inclusive of 0 up to grid_rows-1
+          steps:
+            # Inner loop for grid columns (x-axis)
+            - for_each_column_in_row: # Renamed for clarity
+                for:
+                  value: i # column index
+                  range: [0, ${grid_cols - 1}] # Corrected range
+                  steps:
+                    - calculate_cell_bbox_for_grid_cell: # Renamed
+                        assign:
+                          - min_lon: ${data_bbox[0] + i * cell_width}
+                          - min_lat: ${data_bbox[1] + j * cell_height}
+                          # Ensure max_lon/max_lat do not exceed overall data_bbox slightly due to float precision
+                          - max_lon: ${math.min(data_bbox[0] + (i + 1) * cell_width, data_bbox[2])}
+                          - max_lat: ${math.min(data_bbox[1] + (j + 1) * cell_height, data_bbox[3])}
+                          - current_cell_bbox_str: ${string(min_lon) + "," + string(min_lat) + "," + string(max_lon) + "," + string(max_lat)}
+                    # Innermost loop for zoom segments
+                    - for_each_zoom_segment_in_cell: # Renamed
+                        for:
+                          value: zoom_seg # e.g., [0, 5]
+                          index: k # index of zoom_seg
+                          in: ${tiling_config.zoom_level_segmentation}
+                          steps:
+                            - create_task_definition_for_segment: # Renamed
+                                assign:
+                                  - task_id_str: ${"grid_R" + string(j) + "_C" + string(i) + "_Z" + string(zoom_seg[0]) + "-" + string(zoom_seg[1])}
+                                  - task_definition:
+                                      task_id: ${task_id_str}
+                                      filter_bbox_str: ${current_cell_bbox_str}
+                                      min_zoom_for_task: ${zoom_seg[0]}
+                                      max_zoom_for_task: ${zoom_seg[1]}
+                                  - temp_tasks_list: ${temp_tasks_list + [task_definition]}
+        assign:
+          - mvt_generation_tasks: ${temp_tasks_list} # Final list of all tasks
+          - total_tasks_defined: ${len(mvt_generation_tasks)}
+        next: log_task_generation_complete
+
+    - log_task_generation_complete:
+        call: sys.log
+        args: { text: "Generated " + string(total_tasks_defined) + " MVT generation tasks.", severity: "INFO" }
+        next: run_mvt_generation_jobs_step
+
+    # STAGE 2: Parallel MVT Tile Generation (Calls Subworkflow for each task)
+    - run_mvt_generation_jobs_step:
+        switch:
+          - condition: ${overall_status == "FAILURE" || total_tasks_defined == 0}
+            next: aggregate_mvt_job_outcomes_step
+        parallel:
+          shared: [input_parquet_gcs_path, tiling_config, temp_gcs_bucket_name, workflow_execution_id, MVT_GENERATOR_JOB_NAME_SUFFIX, job_execution_retry_policy, POLLING_INTERVAL_SECONDS, MAX_POLLING_ITERATIONS_MVT, project_id, location] # Added project_id, location
+          for:
+            value: task_def
+            in: ${mvt_generation_tasks}
+            steps:
+              - call_mvt_job_subworkflow:
+                  try:
+                    call: run_cloud_run_job_and_poll
+                    args:
+                      project_id_in: ${project_id} # Pass project_id
+                      location_in: ${location}     # Pass location
+                      job_name_suffix_in: ${MVT_GENERATOR_JOB_NAME_SUFFIX}
+                      job_overrides_in:
+                        container_overrides:
+                          - args: [
+                              "--input_parquet_gcs_path=${input_parquet_gcs_path}",
+                              "--task_filter_bbox=${task_def.filter_bbox_str}",
+                              "--min_zoom_for_task=${string(task_def.min_zoom_for_task)}",
+                              "--max_zoom_for_task=${string(task_def.max_zoom_for_task)}",
+                              "--tiling_config_json_string=${json.encode(tiling_config)}", # Whole config for layer name etc.
+                              "--temp_gcs_bucket_name=${temp_gcs_bucket_name}",
+                              "--workflow_execution_id=${workflow_execution_id}",
+                              "--task_id=${task_def.task_id}"
+                            ]
+                        task_count: 1, timeout: "3600s"
+                      job_retry_policy_in: ${job_execution_retry_policy}
+                      polling_interval_in: ${POLLING_INTERVAL_SECONDS}
+                      max_polling_iterations_in: ${MAX_POLLING_ITERATIONS_MVT}
+                    result: mvt_job_result
+                  retry: ${subworkflow_call_retry_policy}
+                  except:
+                    assign:
+                      - mvt_job_result: {status: "FAILED", error: ${"Subworkflow call failed for MVT job " + task_def.task_id + ": " + error.message}}
+                  return: { # Structure returned by this parallel branch
+                      task_id: ${task_def.task_id},
+                      status: ${mvt_job_result.status},
+                      output_mvt_gcs_dir: ${"gs://" + temp_gcs_bucket_name + "/mvt_tiles/" + workflow_execution_id + "/" + task_def.task_id + "/" if mvt_job_result.status == "SUCCEEDED" else null},
+                      error_details: ${mvt_job_result.error else null}
+                    }
+        result: parallel_mvt_job_results # List of results from each parallel branch
+        next: aggregate_mvt_job_outcomes_step
+
+    - aggregate_mvt_job_outcomes_step:
+        # ... (as in previous version, populates successful_mvt_gcs_dirs and error_messages) ...
+        assign:
+          - successful_mvt_gcs_dirs: []
+          - current_error_messages: ${error_messages}
+        for: {value: job_res, in: '${parallel_mvt_job_results}', steps: {
+            process_mvt_job_result: {switch: [
+                {condition: '${job_res.status == "SUCCEEDED"}', assign: {successful_mvt_gcs_dirs: '${successful_mvt_gcs_dirs + [job_res.output_mvt_gcs_dir]}'}},
+                {condition: '${job_res.status == "FAILED"}', assign: {current_error_messages: '${current_error_messages + [{"task_id": job_res.task_id, "error": job_res.error_details, "stage": "MVT_GENERATION"}]}'}}
+            ]}
+        }}
+        assign:
+          - error_messages: ${current_error_messages}
+          - all_mvt_job_outputs: ${successful_mvt_gcs_dirs}
+        switch:
+          - condition: ${len(all_mvt_job_outputs) == 0 && total_tasks_defined > 0}
+            assign:
+              - overall_status: "FAILURE"
+              - error_messages: ${error_messages + ["No MVT generation tasks succeeded."]}
+            next: write_final_report
+
+    # STAGE 4: Consolidate MVT Tile Directories
+    - run_mvt_consolidation_job_step:
+        switch:
+          - condition: ${overall_status == "FAILURE" || len(all_mvt_job_outputs) == 0}
+            next: run_pmtiles_assembly_job_step # Skip if failed or no MVT outputs
+        try:
+          call: run_cloud_run_job_and_poll
+          args:
+            project_id_in: ${project_id}
+            location_in: ${location}
+            job_name_suffix_in: ${MVT_CONSOLIDATOR_JOB_NAME_SUFFIX}
+            job_overrides_in:
+              container_overrides:
+                - args: [
+                    "--input_mvt_gcs_paths_json_string=${json.encode(all_mvt_job_outputs)}",
+                    "--output_consolidated_mvt_gcs_path=${"gs://" + temp_gcs_bucket_name + "/mvt_merged/" + workflow_execution_id + "/"}",
+                    "--workflow_execution_id=${workflow_execution_id}"
+                  ]
+              task_count: 1, timeout: "3600s" # Timeout for consolidation job
+            job_retry_policy_in: ${job_execution_retry_policy}
+            polling_interval_in: ${POLLING_INTERVAL_SECONDS}
+            max_polling_iterations_in: ${MAX_POLLING_ITERATIONS_CONSOLIDATE}
+          result: consolidation_job_result
+        retry: ${subworkflow_call_retry_policy}
+        except:
+          assign:
+            - consolidation_job_result: {status: "FAILED", error: ${"Subworkflow call failed for MVT consolidation: " + error.message}}
+        assign:
+          - consolidated_mvt_gcs_path: ${"gs://" + temp_gcs_bucket_name + "/mvt_merged/" + workflow_execution_id + "/"}
+        switch:
+          - condition: ${consolidation_job_result.status != "SUCCEEDED"}
+            assign:
+              - overall_status: "FAILURE"
+              - error_messages: ${error_messages + [{"stage": "MVT_CONSOLIDATION", "error": consolidation_job_result.error}]}
+              - consolidated_mvt_gcs_path: null
+        next: run_pmtiles_assembly_job_step
+
+    # STAGE 5: Assemble Final PMTiles
+    - run_pmtiles_assembly_job_step:
+        switch:
+          - condition: ${overall_status == "FAILURE" || consolidated_mvt_gcs_path == null}
+            next: write_final_report # Skip if failed or no consolidated MVTs
+        try:
+          call: run_cloud_run_job_and_poll
+          args:
+            project_id_in: ${project_id}
+            location_in: ${location}
+            job_name_suffix_in: ${PMTILES_ASSEMBLER_JOB_NAME_SUFFIX}
+            job_overrides_in:
+              container_overrides:
+                - args: [
+                    "--input_consolidated_mvt_gcs_path=${consolidated_mvt_gcs_path}",
+                    "--output_pmtiles_gcs_path=${output_pmtiles_gcs_path}",
+                    "--tiling_config_json_string=${json.encode(tiling_config)}",
+                    "--temp_gcs_bucket_name=${temp_gcs_bucket_name}",
+                    "--workflow_execution_id=${workflow_execution_id}"
+                  ]
+              task_count: 1, timeout: "7200s" # Assembly might take longer
+            job_retry_policy_in: ${job_execution_retry_policy}
+            polling_interval_in: ${POLLING_INTERVAL_SECONDS}
+            max_polling_iterations_in: ${MAX_POLLING_ITERATIONS_ASSEMBLE}
+          result: assembly_job_result
+        retry: ${subworkflow_call_retry_policy}
+        except:
+          assign:
+            - assembly_job_result: {status: "FAILED", error: ${"Subworkflow call failed for PMTiles assembly: " + error.message}}
+        switch:
+          - condition: ${assembly_job_result.status != "SUCCEEDED"}
+            assign:
+              - overall_status: "FAILURE"
+              - error_messages: ${error_messages + [{"stage": "PMTILES_ASSEMBLY", "error": assembly_job_result.error}]}
+        next: write_final_report
+
+    # STAGE 6: Reporting & End
+    - write_final_report:
+        # ... (as in previous version) ...
+        call: http.put, args: {url: '${"https://storage.googleapis.com/upload/storage/v1/b/" + temp_gcs_bucket_name + "/o?uploadType=media&name=" + replace(report_gcs_path,"gs://"+temp_gcs_bucket_name+"/","")}', auth: {type: OAuth2}, headers: {"Content-Type": "application/json"}, body: {workflow_execution_id: '${workflow_execution_id}', overall_status: '${overall_status}', input_parquet: '${input_parquet_gcs_path}', output_pmtiles: '${output_pmtiles_gcs_path if overall_status == "SUCCESS" else null}', errors: '${error_messages}', mvt_generation_summary: '${parallel_mvt_job_results else []}'}}, result: report_upload_result
+    - final_log:
+        # ... (as in previous version) ...
+        call: sys.log, args: {text: "Workflow " + workflow_execution_id + " finished. Status: " + overall_status, severity: INFO}
+    - end_workflow:
+        return: {status: ${overall_status}, report_gcs_path: ${report_gcs_path}}
+
+# Subworkflow to run a Cloud Run Job and poll for its completion
+run_cloud_run_job_and_poll:
+  params: [project_id_in, location_in, job_name_suffix_in, job_overrides_in, job_retry_policy_in, polling_interval_in, max_polling_iterations_in]
+  steps:
+    - init_subworkflow_vars:
+        assign:
+          - full_job_name_path: ${"projects/" + project_id_in + "/locations/" + location_in + "/jobs/" + job_name_suffix_in}
+          - execution_resource_name: null # Will be populated by job.run
+          - job_final_status_code: "UNKNOWN_STATUS" # More descriptive internal status
+          - job_error_message_detail: null
+          - current_polling_attempt: 0
+    - try_job_execution_block: # This try/retry is for the job *execution* (run + poll)
+        try:
+          - initiate_job_run_step:
+              call: googleapis.run.v2.projects.locations.jobs.run
+              args:
+                name: ${full_job_name_path}
+                overrides: ${job_overrides_in}
+                # The 'run' API for v2 jobs directly returns the initial Execution object.
+              result: initial_execution_object
+          - extract_execution_resource_name_step:
+              assign:
+                - execution_resource_name: ${initial_execution_object.name} # This is the full path to the execution
+          - log_job_submission_step:
+              call: sys.log
+              args: {text: "Submitted job " + full_job_name_path + ", execution resource: " + execution_resource_name, severity: "INFO"}
+
+          - polling_loop_step:
+              repeat:
+                max_iterations: ${max_polling_iterations_in}
+                steps:
+                  - increment_poll_attempt_step:
+                      assign:
+                        - current_polling_attempt: ${current_polling_attempt + 1}
+                  - get_job_execution_status_step:
+                      try:
+                        call: googleapis.run.v2.projects.locations.executions.get
+                        args:
+                          name: ${execution_resource_name} # Use the full execution resource name
+                        result: current_execution_details
+                      except:
+                        assign:
+                          - job_final_status_code: "POLLING_API_ERROR"
+                          - job_error_message_detail: ${"Polling API call to executions.get failed: " + error.message}
+                        break # Exit repeat loop on polling API failure
+                  - check_job_completion_status_step:
+                      assign:
+                        - job_is_done: false
+                      # Check standard conditions for completion
+                      for:
+                        value: cond
+                        in: ${current_execution_details.conditions}
+                        steps:
+                          - if_condition_is_completed_type:
+                              switch:
+                                - condition: ${cond.type == "Completed" && cond.state == "True"}
+                                  assign:
+                                    - job_is_done: true
+                                    # Determine Succeeded/Failed from overall Execution object counts
+                                    - job_final_status_code: ${if(current_execution_details.succeededCount > 0, "SUCCEEDED", if(current_execution_details.failedCount > 0, "FAILED", if(current_execution_details.cancelledCount > 0, "CANCELLED", "COMPLETED_UNKNOWN_OUTCOME")))}
+                                    - job_error_message_detail: ${if(current_execution_details.failedCount > 0, current_execution_details.terminationReason else if(current_execution_details.cancelledCount > 0, "Job execution cancelled.", null))}
+                                  break # Exit this inner for loop (over conditions)
+                      # Fallback/Direct check on counts if conditions didn't yield a clear terminal state (should not happen if API is consistent)
+                      switch:
+                        - condition: ${job_is_done == false && current_execution_details.succeededCount > 0}
+                          assign: {job_is_done: true, job_final_status_code: "SUCCEEDED"}
+                        - condition: ${job_is_done == false && current_execution_details.failedCount > 0}
+                          assign: {job_is_done: true, job_final_status_code: "FAILED", job_error_message_detail: ${current_execution_details.terminationReason else "Job failed."}}
+                        - condition: ${job_is_done == false && current_execution_details.cancelledCount > 0}
+                          assign: {job_is_done: true, job_final_status_code: "CANCELLED", job_error_message_detail: "Job cancelled."}
+                  - break_if_job_is_done_step:
+                      switch:
+                        - condition: ${job_is_done}
+                          break # Exit polling loop (repeat step)
+                  - log_polling_attempt_step:
+                      call: sys.log
+                      args: {text: "Job execution " + execution_resource_name + " still running. Attempt: " + string(current_polling_attempt) + "/" + string(max_polling_iterations_in), severity: "DEBUG"}
+                  - wait_before_next_poll_step:
+                      call: sys.sleep
+                      args: {seconds: ${polling_interval_in}}
+              # After repeat loop
+              next: check_polling_timeout_step
+
+          - check_polling_timeout_step:
+              switch: # If job_final_status_code is still UNKNOWN, it means max_iterations was hit
+                - condition: ${job_final_status_code == "UNKNOWN_STATUS"}
+                  assign:
+                    - job_final_status_code: "POLLING_TIMEOUT"
+                    - job_error_message_detail: ${"Polling timeout after " + string(current_polling_attempt) + " attempts for job execution " + execution_resource_name}
+              next: return_from_subworkflow # Go to the return step of the subworkflow
+
+        retry: ${job_retry_policy_in} # Retry the entire (initiate + poll) block for the job execution
+        except:
+          assign:
+            - job_final_status_code: "JOB_SUBMISSION_ERROR" # Error during job submission itself or unhandled in polling try
+            - job_error_message_detail: ${"Overall job execution/polling failed for " + full_job_name_path + ": " + error.message}
+          next: return_from_subworkflow
+
+    - return_from_subworkflow:
+        # Normalize CANCELLED and other non-SUCCEEDED states to FAILED for simplicity in main flow
+        return: {
+            status: ${if(job_final_status_code == "SUCCEEDED", "SUCCEEDED", "FAILED")},
+            error: ${job_error_message_detail},
+            final_code: ${job_final_status_code} # For more detailed logging if needed
+        }
+```
